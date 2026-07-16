@@ -1,245 +1,662 @@
-const express = require('express');
-const path = require('path');
-const GoMerchant = require('./GoMerchant');
-const { ImageUploadService } = require("node-upload-images");
-const fetch = (...args) => import("node-fetch").then(({ default: fetch }) => fetch(...args));
-const FormData = require("form-data");
-
-const app = express();
-const sdk = new GoMerchant();
-
-app.set('json spaces', 2);
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-app.set('view engine', 'ejs');
-app.set('views', path.join(__dirname, 'views'));
-
-// ================= FUNGSI UPLOAD =================
-async function toUrl(buffer, provider = "pixhost.to") {
-  if (!Buffer.isBuffer(buffer)) {
-    throw new Error("Input harus buffer");
-  }
-
-  // === CATBOX ===
-  if (provider === "catbox") {
-    const form = new FormData();
-    form.append("fileToUpload", buffer, "file.png");
-    form.append("reqtype", "fileupload");
-
-    const res = await fetch("https://catbox.moe/user/api.php", {
-      method: "POST",
-      body: form,
-      headers: form.getHeaders()
-    });
-
-    const text = await res.text();
-    if (!text.startsWith("http")) throw new Error("Catbox upload gagal");
-    return text;
-  }
-
-  // === DEFAULT PROVIDER (pixhost.to, dll) ===
-  const service = new ImageUploadService(provider);
-  let { directLink } = await service.uploadFromBinary(buffer, "skyzo.png");
-  return directLink;
-}
-
-// ================= ROUTE HALAMAN =================
-app.get('/', (req, res) => {
-    res.render('index');
-});
-
-// ================= AUTH =================
-// Kirim OTP
-app.get('/auth/otp', async (req, res) => {
-    try {
-        let phone = req.query.phone;
-        if (!phone) return res.status(400).json({ success: false, error: 'phone wajib diisi' });
-        if (phone.startsWith("62")) phone = phone.slice(2)
-        const data = await sdk.requestOtp(phone);
-        res.json({ success: true, data: { otp_token: data.data.otp_token, message: "Kode OTP Berhasil Dikirim Via SMS" } });
-    } catch (e) {
-        res.status(400).json({ success: false, error: e.response?.data || e.message });
-    }
-});
-
-// Verifikasi OTP
-app.get('/auth/verify', async (req, res) => {
-    try {
-        const { otp, otp_token } = req.query;
-        if (!otp || !otp_token) return res.status(400).json({ success: false, error: 'otp dan otp_token wajib diisi' });
-        const data = await sdk.verifyOtp(otp, otp_token);
-        res.json({ success: true, data });
-    } catch (e) {
-        res.status(400).json({ success: false, error: e.response?.data || e.message });
-    }
-});
-
-// Refresh token
-app.get('/auth/refresh/token', async (req, res) => {
-    try {
-        const refreshToken = req.query.refresh_token;
-        if (!refreshToken) return res.status(400).json({ success: false, error: 'refresh_token wajib diisi' });
-        const data = await sdk.refreshToken(refreshToken);
-        res.json({ success: true, data });
-    } catch (e) {
-        res.status(401).json({ success: false, error: e.response?.data || e.message });
-    }
-});
-
-// ================= API =================
-// Validasi token & profil
-app.get('/api/validate', async (req, res) => {
-    try {
-        const token = req.query.token;
-        if (!token) return res.status(400).json({ success: false, error: 'token wajib diisi' });
-        const data = await sdk.getMe(token);
-        res.json({ success: true, user: data.user, access_token: token });
-    } catch (e) {
-        res.status(401).json({ success: false, error: e.response?.data || e.message });
-    }
-});
-
-// Profil (me)
-app.get('/api/me', async (req, res) => {
-    try {
-        const token = req.query.token;
-        if (!token) return res.status(400).json({ success: false, error: 'token wajib diisi' });
-        const data = await sdk.getMe(token);
-        res.json({ success: true, data });
-    } catch (e) {
-        res.status(400).json({ success: false, error: e.response?.data || e.message });
-    }
-});
-
-app.get('/api/history', async (req, res) => {
-    try {
-        const token = req.query.token;
-
-        if (!token) {
-            return res.status(400).json({
-                success: false,
-                error: 'token wajib diisi'
-            });
-        }
-
-        const user = await sdk.getMe(token);
-
-        const defaultStartTime = new Date(
-            Date.now() - (7 * 24 * 60 * 60 * 1000)
-        ).toISOString();
-
-        const startTime = req.query.start_time || defaultStartTime;
-
-        const result = await sdk.getJournals(
-            token,
-            user.user.merchant_id,
-            startTime
-        );
-
-        const data = (result.hits || [])
-            .filter(item =>
-                item?.metadata?.transaction?.payment_type === 'qris'
-            )
-            .map(item => {
-                const aspi = item.metadata?.provider_metadata?.aspi;
-
-                return {
-                    id: item.id,
-                    reference_id: item.reference_id,
-                    status: item.status,
-                    time: item.time,
-
-                    amount: aspi?.data?.amount || 0,
-
-                    issuer: aspi?.issuer || null,
-                    acquirer: aspi?.acquirer || null,
-
-                    merchant_name: aspi?.data?.merchant_name || null,
-                    merchant_id: aspi?.data?.merchant_id || null,
-                    merchant_city: aspi?.data?.merchant_city || null,
-
-                    terminal_label:
-                        aspi?.data?.additional_data?.terminal_label || null
-                };
-            });
-
-        res.json({
-            success: true,
-            total: data.length,
-            data
-        });
-
-    } catch (e) {
-        res.status(400).json({
-            success: false,
-            error: e.response?.data || e.message
-        });
-    }
-});
-
-// Daftar payout
-app.get('/api/payouts', async (req, res) => {
-    try {
-        const token = req.query.token;
-        if (!token) return res.status(400).json({ success: false, error: 'token wajib diisi' });
-        const data = await sdk.getPayouts(token);
-        res.json({ success: true, data });
-    } catch (e) {
-        res.status(400).json({ success: false, error: e.response?.data || e.message });
-    }
-});
-
-// QRIS Dinamis → menghasilkan gambar & upload ke hosting, kembalikan URL
-app.get('/api/qris/create', async (req, res) => {
-    try {
-        const { amount, static_qr } = req.query;
-        if (!amount || !static_qr) {
-            return res.status(400).json({ success: false, error: 'Parameter amount dan static_qr wajib diisi' });
-        }
-
-        // Generate QR
-        const data = await sdk.createDynamicQRIS(amount, static_qr);
-        const qrBuffer = Buffer.isBuffer(data.qr_buffer)
-            ? data.qr_buffer
-            : Buffer.from(data.qr_buffer.data);
-
-        // Upload buffer ke image hosting
-        const imageUrl = await toUrl(qrBuffer, "pixhost.to"); // bisa ganti ke "catbox"
-
-        res.json({
-            success: true,
-            image_url: imageUrl,
-            amount: data.amount,
-            qr_string: data.qr_string,
-            created_at: data.created_at
-        });
-    } catch (e) {
-        res.status(400).json({ success: false, error: e.response?.data || e.message });
-    }
-});
-
-// Cek status pembayaran QRIS
-app.get('/api/qris/status', async (req, res) => {
-    try {
-        const { token, amount, created_at } = req.query;
-        if (!token || !amount || !created_at) {
-            return res.status(400).json({ success: false, error: 'token, amount, dan created_at wajib diisi' });
-        }
-
-        const user = await sdk.getMe(token);
-        const logs = await sdk.getJournals(token, user.user.merchant_id, created_at);
-        const amountSearch = parseInt(amount) * 100;
-        const found = logs.hits.find(h => {
-            const txTime = new Date(h.time).getTime();
-            const qrisTime = new Date(created_at).getTime();
-            return h.amount === amountSearch && txTime >= qrisTime;
-        });
-        res.json({ success: true, status: found ? 'PAID' : 'PENDING', data: found || null });
-    } catch (e) {
-        res.status(400).json({ success: false, error: e.response?.data || e.message });
-    }
-});
-
-const PORT = process.env.PORT || 3015;
-app.listen(PORT, () => console.log(`GoMerch listening on port ${PORT}`));
+<!DOCTYPE html>    
+<html lang="id">    
+<head>    
+    <meta charset="UTF-8">    
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">    
+    <title>ZyeGram X Gopay Merchant</title>    
+    <script src="https://cdn.tailwindcss.com"></script>    
+    <script src="https://unpkg.com/lucide@latest"></script>    
+    <link rel="preconnect" href="https://fonts.googleapis.com">    
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>    
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">    
+    <style>    
+        :root {    
+            --bg-deep: #060913;    
+            --card-bg: rgba(16, 18, 27, 0.95);    
+            --card-border: rgba(255, 255, 255, 0.06);    
+            --text-primary: #f1f5f9;    
+            --text-secondary: #94a3b8;    
+            --accent-cyan: #06b6d4;    
+            --accent-magenta: #d946ef;    
+            --accent-emerald: #10b981;    
+            --accent-amber: #f59e0b;    
+            --accent-blue: #3b82f6;    
+            --accent-rose: #f43f5e;    
+            --terminal-bg: #0b0f17;    
+            --terminal-text: #b4f0c8;    
+            --glass-bg: rgba(255, 255, 255, 0.02);    
+            --glass-border: rgba(255, 255, 255, 0.08);    
+        }    
+    
+        * {    
+            box-sizing: border-box;    
+        }    
+    
+        body {    
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;    
+            background: #030712;    
+            background-image:    
+                radial-gradient(ellipse 70% 60% at 10% 20%, rgba(6, 182, 212, 0.08), transparent),    
+                radial-gradient(ellipse 60% 50% at 90% 70%, rgba(217, 70, 239, 0.06), transparent),    
+                radial-gradient(ellipse 60% 50% at 50% 90%, rgba(16, 185, 129, 0.04), transparent);    
+            background-attachment: fixed;    
+            min-height: 100vh;    
+            color: #f1f5f9;    
+            -webkit-font-smoothing: antialiased;    
+            -moz-osx-font-smoothing: grayscale;    
+            margin: 0;    
+        }    
+    
+        .no-scrollbar::-webkit-scrollbar { display: none; }    
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }    
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }    
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }    
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #334155; border-radius: 12px; }    
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #475569; }    
+    
+        .premium-card {    
+            background: rgba(15, 18, 30, 0.9);    
+            backdrop-filter: blur(24px);    
+            -webkit-backdrop-filter: blur(24px);    
+            border: 1px solid rgba(255, 255, 255, 0.07);    
+            border-radius: 28px;    
+            box-shadow: 0 20px 40px -12px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.04);    
+            transition: all 0.4s cubic-bezier(0.22, 0.61, 0.36, 1);    
+            animation: cardAppear 0.55s cubic-bezier(0.22, 0.61, 0.36, 1) forwards;    
+            position: relative;    
+            overflow: hidden;    
+        }    
+        .premium-card:hover {    
+            border-color: rgba(255, 255, 255, 0.12);    
+            box-shadow: 0 24px 48px -12px rgba(6, 182, 212, 0.1), 0 0 0 1px rgba(6, 182, 212, 0.15);    
+            transform: translateY(-3px);    
+        }    
+        .premium-card::before {    
+            content: '';    
+            position: absolute;    
+            top: 0; left: 0; right: 0;    
+            height: 2px;    
+            background: linear-gradient(90deg, transparent, rgba(6, 182, 212, 0.5), rgba(217, 70, 239, 0.4), transparent);    
+            opacity: 0;    
+            transition: opacity 0.5s ease;    
+            pointer-events: none;    
+        }    
+        .premium-card:hover::before { opacity: 1; }    
+    
+        @keyframes cardAppear {    
+            from { opacity: 0; transform: translateY(32px); }    
+            to { opacity: 1; transform: translateY(0); }    
+        }    
+    
+        .glass-input {    
+            background: rgba(255, 255, 255, 0.02);    
+            border: 1.5px solid rgba(255, 255, 255, 0.08);    
+            border-radius: 18px;    
+            transition: all 0.3s ease;    
+            overflow: hidden;    
+        }    
+        .glass-input:focus-within {    
+            border-color: #06b6d4;    
+            background: rgba(6, 182, 212, 0.03);    
+            box-shadow: 0 0 0 6px rgba(6, 182, 212, 0.08), 0 4px 20px rgba(6, 182, 212, 0.12);    
+        }    
+        .glass-input input {    
+            background: transparent;    
+            border: none;    
+            outline: none;    
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;    
+            font-size: 1rem;    
+            color: #f1f5f9;    
+            padding: 18px 0;    
+            width: 100%;    
+        }    
+        .glass-input input::placeholder {    
+            color: #4b5563;    
+            font-family: 'Inter', sans-serif;    
+            font-size: 0.9rem;    
+            letter-spacing: -0.01em;    
+        }    
+        .glass-input .param-label {    
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;    
+            font-size: 0.875rem;    
+            font-weight: 600;    
+            color: #64748b;    
+            white-space: nowrap;    
+            user-select: none;    
+            letter-spacing: -0.02em;    
+            padding-right: 4px;    
+        }    
+    
+        .api-terminal {    
+            background: #0b0f17;    
+            background-image:    
+                linear-gradient(rgba(6, 182, 212, 0.03) 1px, transparent 1px),    
+                linear-gradient(90deg, rgba(6, 182, 212, 0.03) 1px, transparent 1px);    
+            background-size: 24px 24px;    
+            color: #b4f0c8;    
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;    
+            border: 1px solid #1e293b;    
+            border-radius: 22px;    
+            position: relative;    
+        }    
+        .api-terminal .dots {    
+            position: absolute;    
+            top: 14px;    
+            left: 16px;    
+            display: flex;    
+            gap: 9px;    
+            z-index: 2;    
+        }    
+        .api-terminal .dots span {    
+            width: 10px;    
+            height: 10px;    
+            border-radius: 50%;    
+            display: block;    
+        }    
+        .api-terminal .dots span:nth-child(1) { background: #f43f5e; }    
+        .api-terminal .dots span:nth-child(2) { background: #f59e0b; }    
+        .api-terminal .dots span:nth-child(3) { background: #10b981; }    
+        .api-terminal pre {    
+            padding-top: 36px;    
+            scrollbar-width: thin;    
+            scrollbar-color: #334155 transparent;    
+            font-size: 0.9rem;    
+        }    
+        .api-terminal pre::-webkit-scrollbar { width: 5px; height: 5px; }    
+        .api-terminal pre::-webkit-scrollbar-thumb { background: #334155; border-radius: 8px; }    
+    
+        .endpoint-badge {    
+            font-size: 0.75rem;    
+            font-weight: 700;    
+            letter-spacing: 0.05em;    
+            text-transform: uppercase;    
+            padding: 7px 14px;    
+            border-radius: 12px;    
+            display: inline-flex;    
+            align-items: center;    
+            gap: 6px;    
+            transition: all 0.2s ease;    
+        }    
+    
+        .btn-primary {    
+            background: #ffffff;    
+            color: #020617;    
+            font-weight: 700;    
+            font-size: 1rem;    
+            border-radius: 16px;    
+            padding: 18px 28px;    
+            transition: all 0.3s cubic-bezier(0.22, 0.61, 0.36, 1);    
+            border: none;    
+            cursor: pointer;    
+            display: inline-flex;    
+            align-items: center;    
+            justify-content: center;    
+            gap: 10px;    
+            letter-spacing: -0.01em;    
+            width: 100%;    
+            position: relative;    
+            overflow: hidden;    
+            box-shadow: 0 8px 24px rgba(255, 255, 255, 0.08);    
+        }    
+        .btn-primary:hover {    
+            background: #f1f5f9;    
+            box-shadow: 0 12px 32px rgba(255, 255, 255, 0.15);    
+            transform: scale(1.01);    
+        }    
+        .btn-primary:active { transform: scale(0.97); }    
+    
+        .btn-copy {    
+            display: inline-flex;    
+            align-items: center;    
+            gap: 8px;    
+            padding: 12px 22px;    
+            font-size: 0.8125rem;    
+            font-weight: 600;    
+            letter-spacing: 0.02em;    
+            border-radius: 14px;    
+            background: rgba(255, 255, 255, 0.02);    
+            border: 1.5px solid rgba(255, 255, 255, 0.08);    
+            color: #94a3b8;    
+            cursor: pointer;    
+            transition: all 0.3s ease;    
+            white-space: nowrap;    
+            font-family: 'Inter', sans-serif;    
+            backdrop-filter: blur(8px);    
+        }    
+        .btn-copy:hover {    
+            border-color: #06b6d4;    
+            color: #06b6d4;    
+            background: rgba(6, 182, 212, 0.08);    
+            box-shadow: 0 4px 16px rgba(6, 182, 212, 0.15);    
+        }    
+        .btn-copy:active { transform: scale(0.94); }    
+        .btn-copy.copied {    
+            border-color: #10b981;    
+            color: #10b981;    
+            background: rgba(16, 185, 129, 0.1);    
+            animation: copyPulse 0.6s ease;    
+        }    
+        @keyframes copyPulse {    
+            0%, 100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.5); }    
+            50% { box-shadow: 0 0 0 16px rgba(16, 185, 129, 0); }    
+        }    
+    
+        .copy-result-btn {    
+            position: absolute;    
+            top: 12px;    
+            right: 12px;    
+            z-index: 5;    
+            display: inline-flex;    
+            align-items: center;    
+            gap: 6px;    
+            padding: 8px 16px;    
+            font-size: 0.75rem;    
+            font-weight: 600;    
+            letter-spacing: 0.02em;    
+            border-radius: 12px;    
+            background: rgba(255, 255, 255, 0.05);    
+            border: 1px solid rgba(148, 163, 184, 0.25);    
+            color: #94a3b8;    
+            cursor: pointer;    
+            transition: all 0.25s ease;    
+            backdrop-filter: blur(10px);    
+            font-family: 'Inter', sans-serif;    
+        }    
+        .copy-result-btn:hover {    
+            background: rgba(255, 255, 255, 0.1);    
+            border-color: #06b6d4;    
+            color: #06b6d4;    
+        }    
+        .copy-result-btn.copied {    
+            border-color: #10b981;    
+            color: #10b981;    
+            background: rgba(16, 185, 129, 0.15);    
+        }    
+    
+        .toast-container {    
+            position: fixed;    
+            bottom: 32px;    
+            right: 32px;    
+            z-index: 9999;    
+            pointer-events: none;    
+        }    
+        .toast {    
+            background: #ffffff;    
+            color: #020617;    
+            font-size: 0.9375rem;    
+            font-weight: 700;    
+            padding: 18px 28px;    
+            border-radius: 18px;    
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4);    
+            display: flex;    
+            align-items: center;    
+            gap: 12px;    
+            opacity: 0;    
+            transform: translateY(24px) scale(0.95);    
+            transition: all 0.4s cubic-bezier(0.22, 0.61, 0.36, 1);    
+            pointer-events: auto;    
+        }    
+        .toast.show {    
+            opacity: 1;    
+            transform: translateY(0) scale(1);    
+        }    
+    
+        footer {    
+            border-top: 1px solid rgba(255, 255, 255, 0.05);    
+            background: rgba(0, 0, 0, 0.3);    
+            backdrop-filter: blur(16px);    
+        }    
+    </style>    
+</head>    
+<body class="antialiased">    
+    
+    <nav class="sticky top-0 z-50 w-full bg-black/70 backdrop-blur-2xl border-b border-white/5 shadow-lg" style="background: rgba(2, 2, 8, 0.75); backdrop-filter: blur(28px); -webkit-backdrop-filter: blur(28px);">    
+        <div class="max-w-6xl mx-auto px-5 md:px-8 h-20 flex items-center justify-between">    
+            <div class="flex items-center gap-4">    
+                <div class="w-11 h-11 bg-gradient-to-br from-cyan-500 to-blue-600 rounded-2xl flex items-center justify-center shadow-xl shadow-cyan-500/20 ring-1 ring-white/10">    
+                    <i data-lucide="terminal" class="w-6 h-6 text-white"></i>    
+                </div>    
+                <span class="font-black text-2xl tracking-tight text-white">    
+                    GoMerch <span class="bg-gradient-to-r from-cyan-400 to-fuchsia-400 bg-clip-text text-transparent">API Explorer</span>    
+                </span>    
+            </div>    
+            <div class="flex items-center gap-4">    
+                <div class="hidden sm:flex items-center gap-2 px-4 py-2 bg-cyan-500/10 rounded-full border border-cyan-500/20">    
+                    <span class="relative flex h-3 w-3">    
+                        <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75"></span>    
+                        <span class="relative inline-flex rounded-full h-3 w-3 bg-cyan-400"></span>    
+                    </span>    
+                    <span class="text-[0.7rem] font-black text-cyan-300 uppercase tracking-widest">Live Server</span>    
+                </div>    
+            </div>    
+        </div>    
+    </nav>    
+    
+    <main class="max-w-6xl mx-auto p-4 sm:p-6 md:p-10 pb-32">    
+        <div class="space-y-6 sm:space-y-8">    
+                
+            <div class="premium-card p-6 sm:p-8" data-endpoint="auth-otp">    
+                <div class="flex flex-wrap items-center justify-between gap-4 mb-6">    
+                    <div class="flex items-center gap-4 flex-wrap">    
+                        <span class="endpoint-badge bg-cyan-500/10 text-cyan-300 ring-1 ring-cyan-500/30">    
+                            <i data-lucide="arrow-right-circle" class="w-4 h-4"></i> GET    
+                        </span>    
+                        <code class="text-lg font-bold text-white tracking-tight">/auth/otp</code>    
+                    </div>    
+                    <button onclick="copyEndpointWithParams('auth-otp', '/auth/otp', ['phone'])" class="btn-copy" id="copy-btn-auth-otp">    
+                        <i data-lucide="copy" class="w-4 h-4"></i>    
+                    </button>    
+                </div>    
+                <div class="flex flex-col lg:flex-row gap-6 items-stretch">    
+                    <div class="w-full lg:w-1/2 space-y-4 flex flex-col">    
+                        <div class="glass-input flex items-center px-5">    
+                            <span class="param-label min-w-[60px] text-cyan-300">phone=</span>    
+                            <input type="text" id="param-auth-otp-phone" placeholder="628xxxxxxxx" class="w-full bg-transparent outline-none py-5 text-lg">    
+                        </div>    
+                        <button onclick="runApiTest('/auth/otp', {phone: getVal('param-auth-otp-phone')}, 'res-otp')" class="btn-primary mt-auto py-5">    
+                            <i data-lucide="play" class="w-5 h-5"></i> <span>Jalankan</span>    
+                        </button>    
+                    </div>    
+                    <div class="w-full lg:w-1/2 min-h-[180px]">    
+                        <div class="api-terminal relative h-full min-h-[180px] rounded-2xl">    
+                            <div class="dots"><span></span><span></span><span></span></div>    
+                            <button class="copy-result-btn" onclick="copyResult('res-otp')">    
+                                <i data-lucide="copy" class="w-3.5 h-3.5"></i>    
+                            </button>    
+                            <pre id="res-otp" class="p-5 sm:p-6 h-full overflow-auto custom-scrollbar" style="padding-top: 42px;">// Response JSON</pre>    
+                        </div>    
+                    </div>    
+                </div>    
+            </div>    
+    
+            <div class="premium-card p-6 sm:p-8" data-endpoint="auth-verify">    
+                <div class="flex flex-wrap items-center justify-between gap-4 mb-6">    
+                    <div class="flex items-center gap-4 flex-wrap">    
+                        <span class="endpoint-badge bg-fuchsia-500/10 text-fuchsia-300 ring-1 ring-fuchsia-500/30">    
+                            <i data-lucide="arrow-right-circle" class="w-4 h-4"></i> GET    
+                        </span>    
+                        <code class="text-lg font-bold text-white tracking-tight">/auth/verify</code>    
+                    </div>    
+                    <button onclick="copyEndpointWithParams('auth-verify', '/auth/verify', ['otp', 'otp_token'])" class="btn-copy" id="copy-btn-auth-verify">    
+                        <i data-lucide="copy" class="w-4 h-4"></i>    
+                    </button>    
+                </div>    
+                <div class="flex flex-col lg:flex-row gap-6 items-stretch">    
+                    <div class="w-full lg:w-1/2 space-y-4 flex flex-col">    
+                        <div class="glass-input flex items-center px-5">    
+                            <span class="param-label min-w-[46px] text-fuchsia-300">otp=</span>    
+                            <input type="text" id="param-auth-verify-otp" placeholder="1234" class="w-full bg-transparent outline-none py-5 text-lg">    
+                        </div>    
+                        <div class="glass-input flex items-center px-5">    
+                            <span class="param-label min-w-[98px] text-fuchsia-300">otp_token=</span>    
+                            <input type="text" id="param-auth-verify-otp_token" placeholder="token_dari_request_otp" class="w-full bg-transparent outline-none py-5 text-lg">    
+                        </div>    
+                        <button onclick="runApiTest('/auth/verify', {otp: getVal('param-auth-verify-otp'), otp_token: getVal('param-auth-verify-otp_token')}, 'res-verify')" class="btn-primary mt-auto py-5">    
+                            <i data-lucide="play" class="w-5 h-5"></i> <span>Jalankan</span>    
+                        </button>    
+                    </div>    
+                    <div class="w-full lg:w-1/2 min-h-[220px]">    
+                        <div class="api-terminal relative h-full min-h-[220px] rounded-2xl">    
+                            <div class="dots"><span></span><span></span><span></span></div>    
+                            <button class="copy-result-btn" onclick="copyResult('res-verify')">    
+                                <i data-lucide="copy" class="w-3.5 h-3.5"></i>    
+                            </button>    
+                            <pre id="res-verify" class="p-5 sm:p-6 h-full overflow-auto custom-scrollbar" style="padding-top: 42px;">// Response JSON</pre>    
+                        </div>    
+                    </div>    
+                </div>    
+            </div>    
+    
+            <div class="premium-card p-6 sm:p-8 border-amber-500/20 bg-gradient-to-br from-[#0f121f] to-amber-950/10" data-endpoint="api-history">    
+                <div class="flex flex-wrap items-center justify-between gap-4 mb-6">    
+                    <div class="flex items-center gap-4 flex-wrap">    
+                        <span class="endpoint-badge bg-amber-500/10 text-amber-300 ring-1 ring-amber-500/30">    
+                            <i data-lucide="arrow-right-circle" class="w-4 h-4"></i> GET    
+                        </span>    
+                        <code class="text-lg font-bold text-white tracking-tight">/api/history</code>    
+                    </div>    
+                    <button onclick="copyEndpointWithParams('api-history', '/api/history', ['token', 'start_time'])" class="btn-copy" id="copy-btn-api-history">    
+                        <i data-lucide="copy" class="w-4 h-4"></i>    
+                    </button>    
+                </div>    
+                <div class="flex flex-col lg:flex-row gap-6 items-stretch">    
+                    <div class="w-full lg:w-1/2 space-y-4 flex flex-col">    
+                        <div class="glass-input flex items-center px-5 border-amber-500/20">    
+                            <span class="param-label min-w-[58px] text-amber-300">token=</span>    
+                            <input type="text" id="param-api-history-token" placeholder="access_token_anda" class="w-full bg-transparent outline-none py-5 text-lg">    
+                        </div>    
+                        <div class="glass-input flex items-center px-5">    
+                            <span class="param-label min-w-[98px]">start_time=</span>    
+                            <input type="text" id="param-api-history-start_time" placeholder="YYYY-MM-DD (opsional)" class="w-full bg-transparent outline-none py-5 text-lg">    
+                        </div>    
+                        <button onclick="runApiTest('/api/history', {token: getVal('param-api-history-token'), start_time: getVal('param-api-history-start_time')}, 'res-hist')" class="btn-primary mt-auto py-5">    
+                            <i data-lucide="play" class="w-5 h-5"></i> <span>Jalankan</span>    
+                        </button>    
+                    </div>    
+                    <div class="w-full lg:w-1/2 min-h-[220px]">    
+                        <div class="api-terminal relative h-full min-h-[220px] rounded-2xl">    
+                            <div class="dots"><span></span><span></span><span></span></div>    
+                            <button class="copy-result-btn" onclick="copyResult('res-hist')">    
+                                <i data-lucide="copy" class="w-3.5 h-3.5"></i>    
+                            </button>    
+                            <pre id="res-hist" class="p-5 sm:p-6 h-full overflow-auto custom-scrollbar" style="padding-top: 42px;">// Response JSON</pre>    
+                        </div>    
+                    </div>    
+                </div>    
+            </div>    
+    
+            <div class="premium-card p-6 sm:p-8" data-endpoint="api-qris-create">    
+                <div class="flex flex-wrap items-center justify-between gap-4 mb-6">    
+                    <div class="flex items-center gap-4 flex-wrap">    
+                        <span class="endpoint-badge bg-emerald-500/10 text-emerald-300 ring-1 ring-emerald-500/30">    
+                            <i data-lucide="arrow-right-circle" class="w-4 h-4"></i> GET    
+                        </span>    
+                        <code class="text-lg font-bold text-white tracking-tight">/api/qris/create</code>    
+                    </div>    
+                    <button onclick="copyEndpointWithParams('api-qris-create', '/api/qris/create', ['amount', 'static_qr'])" class="btn-copy" id="copy-btn-api-qris-create">    
+                        <i data-lucide="copy" class="w-4 h-4"></i>    
+                    </button>    
+                </div>    
+                <div class="flex flex-col lg:flex-row gap-6 items-stretch">    
+                    <div class="w-full lg:w-1/2 space-y-4 flex flex-col">    
+                        <div class="glass-input flex items-center px-5">    
+                            <span class="param-label min-w-[72px] text-emerald-300">amount=</span>    
+                            <input type="number" id="param-api-qris-create-amount" placeholder="50000" class="w-full bg-transparent outline-none py-5 text-lg">    
+                        </div>    
+                        <div class="glass-input flex items-center px-5">    
+                            <span class="param-label min-w-[82px] text-emerald-300">static_qr=</span>    
+                            <input type="text" id="param-api-qris-create-static_qr" placeholder="000201010212..." class="w-full bg-transparent outline-none py-5 text-lg">    
+                        </div>    
+                        <button onclick="runApiTest('/api/qris/create', {amount: getVal('param-api-qris-create-amount'), static_qr: getVal('param-api-qris-create-static_qr')}, 'res-qr')" class="btn-primary mt-auto py-5">    
+                            <i data-lucide="play" class="w-5 h-5"></i> <span>Jalankan</span>    
+                        </button>    
+                    </div>    
+                    <div class="w-full lg:w-1/2 min-h-[220px]">    
+                        <div class="api-terminal relative h-full min-h-[220px] rounded-2xl">    
+                            <div class="dots"><span></span><span></span><span></span></div>    
+                            <button class="copy-result-btn" onclick="copyResult('res-qr')">    
+                                <i data-lucide="copy" class="w-3.5 h-3.5"></i>    
+                            </button>    
+                            <pre id="res-qr" class="p-5 sm:p-6 h-full overflow-auto custom-scrollbar" style="padding-top: 42px;">// Response JSON</pre>    
+                        </div>    
+                    </div>    
+                </div>    
+            </div>    
+    
+            <div class="premium-card p-6 sm:p-8" data-endpoint="auth-refresh">    
+                <div class="flex flex-wrap items-center justify-between gap-4 mb-6">    
+                    <div class="flex items-center gap-4 flex-wrap">    
+                        <span class="endpoint-badge bg-blue-500/10 text-blue-300 ring-1 ring-blue-500/30">    
+                            <i data-lucide="arrow-right-circle" class="w-4 h-4"></i> GET    
+                        </span>    
+                        <code class="text-lg font-bold text-white tracking-tight">/auth/refresh/token</code>    
+                    </div>    
+                    <button onclick="copyEndpointWithParams('auth-refresh', '/auth/refresh/token', ['refresh_token'])" class="btn-copy" id="copy-btn-auth-refresh">    
+                        <i data-lucide="copy" class="w-4 h-4"></i>    
+                    </button>    
+                </div>    
+                <div class="flex flex-col lg:flex-row gap-6 items-stretch">    
+                    <div class="w-full lg:w-1/2 space-y-4 flex flex-col">    
+                        <div class="glass-input flex items-center px-5">    
+                            <span class="param-label min-w-[120px] text-blue-300">refresh_token=</span>    
+                            <input type="text" id="param-auth-refresh-refresh_token" placeholder="refresh_token_anda" class="w-full bg-transparent outline-none py-5 text-lg">    
+                        </div>    
+                        <button onclick="runApiTest('/auth/refresh/token', {refresh_token: getVal('param-auth-refresh-refresh_token')}, 'res-refresh')" class="btn-primary mt-auto py-5">    
+                            <i data-lucide="play" class="w-5 h-5"></i> <span>Jalankan</span>    
+                        </button>    
+                    </div>    
+                    <div class="w-full lg:w-1/2 min-h-[180px]">    
+                        <div class="api-terminal relative h-full min-h-[180px] rounded-2xl">    
+                            <div class="dots"><span></span><span></span><span></span></div>    
+                            <button class="copy-result-btn" onclick="copyResult('res-refresh')">    
+                                <i data-lucide="copy" class="w-3.5 h-3.5"></i>    
+                            </button>    
+                            <pre id="res-refresh" class="p-5 sm:p-6 h-full overflow-auto custom-scrollbar" style="padding-top: 42px;">// Response JSON</pre>    
+                        </div>    
+                    </div>    
+                </div>    
+            </div>    
+    
+        </div>    
+    </main>    
+    
+    <footer class="w-full py-8 px-4 text-center border-t border-white/5">    
+        <div class="max-w-6xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4">    
+            <div class="flex items-center gap-2 text-slate-400 text-sm">    
+                <i data-lucide="code-2" class="w-4 h-4 text-cyan-400"></i>    
+                <span class="font-medium tracking-wide">2026 Development By <span class="font-bold text-white">ZyeGram</span></span>    
+            </div>    
+            <div class="flex items-center gap-4 text-xs text-slate-500">    
+                <span class="flex items-center gap-1"><i data-lucide="shield-check" class="w-3.5 h-3.5 text-emerald-400"></i> Secure API</span>    
+                <span class="flex items-center gap-1"><i data-lucide="zap" class="w-3.5 h-3.5 text-amber-400"></i> High Performance</span>    
+            </div>    
+        </div>    
+    </footer>    
+    
+    <div class="toast-container">    
+        <div id="toast" class="toast">    
+            <span class="toast-icon">✅</span>    
+            <span id="toast-msg">Copied!</span>    
+        </div>    
+    </div>    
+    
+    <script>    
+        lucide.createIcons();    
+    
+        const BASE_URL = window.location.origin;    
+    
+        function getVal(id) {    
+            const el = document.getElementById(id);    
+            return el ? el.value.trim() : '';    
+        }    
+    
+        let toastTimer;    
+        function showToast(message, icon = '✅') {    
+            const toast = document.getElementById('toast');    
+            const msg = document.getElementById('toast-msg');    
+            const iconEl = toast.querySelector('.toast-icon');    
+            iconEl.textContent = icon;    
+            msg.textContent = message;    
+            toast.classList.add('show');    
+            clearTimeout(toastTimer);    
+            toastTimer = setTimeout(() => {    
+                toast.classList.remove('show');    
+            }, 2400);    
+        }    
+    
+        function copyEndpointWithParams(endpointKey, path, paramNames) {    
+            const params = {};    
+            let filledCount = 0;    
+            paramNames.forEach(pName => {    
+                const inputId = `param-${endpointKey}-${pName}`;    
+                const val = getVal(inputId);    
+                params[pName] = val;     
+                if (val !== '') filledCount++;    
+            });    
+            const query = new URLSearchParams(params).toString();    
+            const fullUrl = query ? `${BASE_URL}${path}?${query}` : `${BASE_URL}${path}`;    
+            navigator.clipboard.writeText(fullUrl).then(() => {    
+                const btn = document.getElementById(`copy-btn-${endpointKey}`);    
+                if (btn) {    
+                    btn.classList.add('copied');    
+                    setTimeout(() => btn.classList.remove('copied'), 1500);    
+                }    
+                const suffix = filledCount > 0 ? ` (+ ${filledCount} param)` : '';    
+                showToast(`URL disalin${suffix}`, '📋');    
+            }).catch(() => {    
+                const ta = document.createElement('textarea');    
+                ta.value = fullUrl;    
+                ta.style.position = 'fixed'; ta.style.opacity = '0';    
+                document.body.appendChild(ta);    
+                ta.select();    
+                try { document.execCommand('copy'); showToast('URL disalin', '📋'); } catch (e) { showToast('Gagal menyalin', '⚠️'); }    
+                document.body.removeChild(ta);    
+            });    
+        }    
+    
+        function copyResult(preId) {    
+            const pre = document.getElementById(preId);    
+            if (!pre) return;    
+            const text = pre.innerText || pre.textContent;    
+            navigator.clipboard.writeText(text).then(() => {    
+                const terminal = pre.closest('.api-terminal');    
+                const btn = terminal ? terminal.querySelector('.copy-result-btn') : null;    
+                if (btn) {    
+                    btn.classList.add('copied');    
+                    setTimeout(() => btn.classList.remove('copied'), 1500);    
+                }    
+                showToast('Result disalin', '📋');    
+            }).catch(() => {    
+                const ta = document.createElement('textarea');    
+                ta.value = text;    
+                ta.style.position = 'fixed'; ta.style.opacity = '0';    
+                document.body.appendChild(ta);    
+                ta.select();    
+                try { document.execCommand('copy'); showToast('Result disalin', '📋'); } catch (e) { showToast('Gagal menyalin', '⚠️'); }    
+                document.body.removeChild(ta);    
+            });    
+        }    
+    
+        async function fetchGET(url, params = {}) {    
+            Object.keys(params).forEach(k => {    
+                if (params[k] === '' || params[k] === null || params[k] === undefined) delete params[k];    
+            });    
+            const query = new URLSearchParams(params).toString();    
+            const fullUrl = query ? `${url}?${query}` : url;    
+            try {    
+                const res = await fetch(fullUrl);    
+                const data = await res.json();    
+                return data;    
+            } catch (error) {    
+                return {    
+                    success: false,    
+                    error_type: "Network / CORS Error",    
+                    message: error.message,    
+                    attempted_url: fullUrl,    
+                    hint: "Pastikan backend server berjalan dan mengizinkan CORS."    
+                };    
+            }    
+        }    
+    
+        async function runApiTest(endpoint, params, resultElementId) {    
+            const resEl = document.getElementById(resultElementId);    
+            resEl.innerText = "// Loading...";    
+            resEl.style.color = '#fbbf24';    
+            try {    
+                const res = await fetchGET(endpoint, params);    
+                resEl.style.color = res.error_type === "Network / CORS Error" ? '#f87171' : '#b4f0c8';    
+                resEl.innerText = JSON.stringify(res, null, 2);    
+            } catch (e) {    
+                resEl.style.color = '#f87171';    
+                resEl.innerText = "// Error:\n" + e.message;    
+            }    
+        }    
+    
+        document.addEventListener('DOMContentLoaded', () => {    
+            lucide.createIcons();    
+        });    
+        const observer = new MutationObserver(() => { lucide.createIcons(); });    
+        observer.observe(document.getElementById('toast'), { childList: true, subtree: true });    
+    </script>    
+</body>    
+</html>
